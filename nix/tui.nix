@@ -4,7 +4,11 @@ let
   src = ../ui-tui;
   npmDeps = pkgs.fetchNpmDeps {
     inherit src;
-    hash = "sha256-dft3LwOtZ7B5pPvJjaejCSw4t2j2yf80tKLBUEHe1Cs=";
+    # Fetcher v2 includes packument metadata needed by workspace/native-bin
+    # dependencies such as esbuild; v1 produced a hash-consistent cache that
+    # still missed esbuild during offline npm ci.
+    hash = "sha256-c/KKcmGC2bnPZHzSHJktXVJxVlgByA4rqnlM1A0eKjI=";
+    fetcherVersion = 2;
   };
 
   npm = hermesNpmLib.mkNpmPassthru { folder = "ui-tui"; attr = "tui"; pname = "hermes-tui"; };
@@ -17,6 +21,7 @@ pkgs.buildNpmPackage (npm // {
   inherit src npmDeps version;
 
   doCheck = false;
+  npmDepsFetcherVersion = 2;
   npmFlags = [ "--legacy-peer-deps" ];
 
   installPhase = ''

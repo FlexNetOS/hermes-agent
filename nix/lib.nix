@@ -167,26 +167,44 @@
         # Compute the actual hash from the lockfile directly using
         # prefetch-npm-deps. This avoids false "ok" from nix build when
         # an old derivation is cached in a substituter (cachix/cache.nixos.org).
+        # Fetcher v2 hashes are intentionally different from prefetch-npm-deps'
+        # v1 hash; for those derivations, let nix validate .#attr.npmDeps and
+        # parse the fixed-output mismatch when the stored hash is stale.
         LOCK_FILE="$FOLDER/package-lock.json"
-        NEW_HASH=$(${pkgs.lib.getExe pkgs.prefetch-npm-deps} "$LOCK_FILE" 2>/dev/null)
-        if [ -z "$NEW_HASH" ]; then
-          echo "    prefetch-npm-deps failed, falling back to nix build" >&2
+        if grep -qE 'fetcherVersion = 2|npmDepsFetcherVersion = 2' "$NIX_FILE"; then
           OUTPUT=$(nix build ".#$ATTR.npmDeps" --no-link --print-build-logs 2>&1)
           STATUS=$?
           if [ "$STATUS" -eq 0 ]; then
-            echo "    ok (via nix build)"
+            echo "    ok (via nix build fetcher v2)"
             continue
           fi
           NEW_HASH=$(echo "$OUTPUT" | awk '/got:/ {print $2; exit}')
           if [ -z "$NEW_HASH" ]; then
-            if echo "$OUTPUT" | grep -qE "throttled|HTTP error 418|substituter .* is disabled|some outputs of .* are not valid"; then
-              echo "    skipped (transient cache failure — see primary nix build for real status)" >&2
-              echo "$OUTPUT" | tail -8 >&2
-              continue
-            fi
-            echo "    build failed with no hash mismatch:" >&2
+            echo "    fetcher v2 build failed with no hash mismatch:" >&2
             echo "$OUTPUT" | tail -40 >&2
             exit 1
+          fi
+        else
+          NEW_HASH=$(${pkgs.lib.getExe pkgs.prefetch-npm-deps} "$LOCK_FILE" 2>/dev/null)
+          if [ -z "$NEW_HASH" ]; then
+            echo "    prefetch-npm-deps failed, falling back to nix build" >&2
+            OUTPUT=$(nix build ".#$ATTR.npmDeps" --no-link --print-build-logs 2>&1)
+            STATUS=$?
+            if [ "$STATUS" -eq 0 ]; then
+              echo "    ok (via nix build)"
+              continue
+            fi
+            NEW_HASH=$(echo "$OUTPUT" | awk '/got:/ {print $2; exit}')
+            if [ -z "$NEW_HASH" ]; then
+              if echo "$OUTPUT" | grep -qE "throttled|HTTP error 418|substituter .* is disabled|some outputs of .* are not valid"; then
+                echo "    skipped (transient cache failure — see primary nix build for real status)" >&2
+                echo "$OUTPUT" | tail -8 >&2
+                continue
+              fi
+              echo "    build failed with no hash mismatch:" >&2
+              echo "$OUTPUT" | tail -40 >&2
+              exit 1
+            fi
           fi
         fi
 

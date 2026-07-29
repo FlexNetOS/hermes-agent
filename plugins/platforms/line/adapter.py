@@ -92,7 +92,10 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_audio_from_bytes,
+    cache_document_from_bytes,
     cache_image_from_bytes,
+    cache_video_from_bytes,
 )
 from gateway.config import Platform
 
@@ -132,6 +135,21 @@ DEFAULT_INTERRUPTED_TEXT = "Run was interrupted before completion."
 MEDIA_TOKEN_TTL_SECONDS = 1800  # 30 minutes; LINE caches the URL aggressively
 LINE_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per LINE docs
 LINE_AV_MAX_BYTES = 200 * 1024 * 1024  # 200 MB for voice/video
+
+# Map LINE webhook message types to the normalized MessageType the gateway
+# routes on. LINE has no separate "voice" type — audio messages are recorded
+# voice clips, so they map to VOICE (which the gateway sends through STT),
+# mirroring how Telegram/WhatsApp classify voice notes. Anything unknown
+# falls back to TEXT.
+_LINE_MESSAGE_TYPES = {
+    "text": MessageType.TEXT,
+    "image": MessageType.PHOTO,
+    "video": MessageType.VIDEO,
+    "audio": MessageType.VOICE,
+    "file": MessageType.DOCUMENT,
+    "location": MessageType.LOCATION,
+    "sticker": MessageType.STICKER,
+}
 
 # A 1×1 transparent PNG used as fallback video preview thumbnail when no
 # explicit preview is supplied — LINE requires ``previewImageUrl`` for
@@ -258,7 +276,9 @@ def verify_line_signature(body: bytes, signature: str, channel_secret: str) -> b
         expected = base64.b64encode(digest).decode("utf-8")
     except Exception:
         return False
-    return hmac.compare_digest(expected, signature)
+    # Compare as bytes: compare_digest raises TypeError on a str with
+    # non-ASCII characters, and the signature is a raw request header.
+    return hmac.compare_digest(expected.encode(), signature.encode())
 
 
 # ---------------------------------------------------------------------------
@@ -725,7 +745,7 @@ class LineAdapter(BasePlatformAdapter):
     # Connection lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.channel_access_token or not self.channel_secret:
             self._set_fatal_error(
                 "config_missing",
@@ -938,11 +958,15 @@ class LineAdapter(BasePlatformAdapter):
 
         if msg_type == "text":
             text = msg.get("text", "") or ""
-        elif msg_type in {"image", "audio", "video", "file"}:
-            local_path = await self._download_media(message_id, msg_type)
+        elif msg_type in ("image", "audio", "video", "file"):
+            local_path, media_type = await self._download_media(
+                message_id,
+                msg_type,
+                filename=msg.get("fileName") or msg.get("file_name"),
+            )
             if local_path:
                 media_urls.append(local_path)
-                media_types.append(msg_type)
+                media_types.append(media_type)
             text = f"[{msg_type}]"
         elif msg_type == "sticker":
             keywords = msg.get("keywords") or []
@@ -968,7 +992,7 @@ class LineAdapter(BasePlatformAdapter):
 
         event_obj = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT if msg_type == "text" else MessageType.IMAGE,
+            message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT),
             source=source_obj,
             raw_message=event,
             message_id=message_id,
@@ -1037,14 +1061,20 @@ class LineAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-    async def _download_media(self, message_id: str, msg_type: str) -> Optional[str]:
+    async def _download_media(
+        self,
+        message_id: str,
+        msg_type: str,
+        *,
+        filename: Optional[str] = None,
+    ) -> Tuple[Optional[str], str]:
         if not self._client or not message_id:
-            return None
+            return None, ""
         try:
             data = await self._client.fetch_content(message_id)
         except Exception as exc:
             logger.warning("LINE: failed to fetch %s content for %s: %s", msg_type, message_id, exc)
-            return None
+            return None, ""
         ext = {
             "image": ".jpg",
             "audio": ".m4a",
@@ -1052,10 +1082,22 @@ class LineAdapter(BasePlatformAdapter):
             "file": ".bin",
         }.get(msg_type, ".bin")
         try:
-            return cache_image_from_bytes(data, ext=ext)
+            if msg_type == "image":
+                return cache_image_from_bytes(data, ext=ext), "image/jpeg"
+            if msg_type == "audio":
+                media_type = mimetypes.guess_type(f"audio{ext}")[0] or "audio/mp4"
+                return cache_audio_from_bytes(data, ext=ext), media_type
+            if msg_type == "video":
+                media_type = mimetypes.guess_type(f"video{ext}")[0] or "video/mp4"
+                return cache_video_from_bytes(data, ext=ext), media_type
+            document_name = filename or f"line_file{ext}"
+            return (
+                cache_document_from_bytes(data, document_name),
+                mimetypes.guess_type(document_name)[0] or "application/octet-stream",
+            )
         except Exception as exc:
             logger.warning("LINE: failed to cache %s payload: %s", msg_type, exc)
-            return None
+            return None, ""
 
     # ------------------------------------------------------------------
     # Outbound send (text)
